@@ -581,6 +581,8 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
   // Specially optimize memory movement as it doesn't look like dataflow in SSA.
   FPM.addPass(MemCpyOptPass());
 
+  FPM.addPass(LoopSimplifyPass());
+
   FPM.addPass(DSEPass());
   FPM.addPass(createFunctionToLoopPassAdaptor(
       LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
@@ -1656,6 +1658,8 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
   // Remove dead memcpy()'s.
   MainFPM.addPass(MemCpyOptPass());
+
+  MainFPM.addPass(LoopSimplifyPass());
 
   // Nuke dead stores.
   MainFPM.addPass(DSEPass());

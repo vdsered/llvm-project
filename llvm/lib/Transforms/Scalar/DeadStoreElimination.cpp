@@ -47,6 +47,8 @@
 #include "llvm/Analysis/MemorySSAUpdater.h"
 #include "llvm/Analysis/MustExecute.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
@@ -79,6 +81,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
@@ -108,8 +111,64 @@ STATISTIC(NumGetDomMemoryDefPassed,
 STATISTIC(NumDomMemDefChecks,
           "Number iterations check for reads in getDomMemoryDef");
 
+STATISTIC(NotRotatedFormLoop, "Number of loops that are not in rotated form "
+                              "and failed to be transformed");
+STATISTIC(NotSimplifyFormLoop, "Number of loops that are not in simplify form "
+                               "and failed to be transformed");
+STATISTIC(ComputedStoreMemRanges,
+          "Number of memory ranges computed for stores");
+STATISTIC(ComputedMemIntrMemRanges,
+          "Number of memory ranges computed for memory intrinsics");
+STATISTIC(ReplacedGuard,
+          "Number of store's block replaced by guard in killing block set");
+STATISTIC(MissedGuard, "Number of missed guards");
+STATISTIC(TooManyBlocksInLoop,
+          "Number of loop which have too many blocks (more than 20)");
+STATISTIC(
+    VolatileOrAtomicInLoop,
+    "Number of stores in loop skipped because store is volatile or atomic");
+STATISTIC(LoopCount, "Number of loops to handle");
+STATISTIC(CollectedStoreCount, "Number of loop-variant stores");
+STATISTIC(FailedToComputeRangeForStore,
+          "Number of memory intrinsics without computed memory range");
+STATISTIC(
+    MayThrowInLoop,
+    "Number of loop skipped because there is an instruction that may throw");
+STATISTIC(LoopVariantStoreRemoved, "Number of deleted loop variant stores");
+STATISTIC(RemovedMemIntrWithRange, "Number of deleted ");
+
 DEBUG_COUNTER(MemorySSACounter, "dse-memoryssa",
               "Controls which MemoryDefs are eliminated.");
+
+// If enabled, this optimizes loop patterns like this
+// for (int i = 0; i < N; ++i)
+//    P[i] = 1;
+// for (int i = 0; i < N; ++i)
+//    P[i] = 2;
+//
+// or
+//
+// memset(P, 0, sizeof(int) * N);
+// for (int i = 0; i < N; ++i)
+//    P[i] = 2;
+static cl::opt<bool> EnableOptimizationAcrossLoops(
+    "dse-optimize-across-loops", cl::init(true), cl::Hidden,
+    cl::desc("Enable elimination for redundant "
+             "loop-variant stores and memory intrinsics"));
+
+// Loops with relatively small number of basic blocks are more likely to be met,
+// but there are may be loops with > 1000 basic blocks, so we introduce an upper
+// limit to preserve time
+static cl::opt<unsigned> BasicBlocksInOneLoopThreshold(
+    "dse-basic-blocks-in-loop-threshold", cl::init(20), cl::Hidden,
+    cl::desc("The maximum number of basic block in a loop in total"));
+
+const int MaxStoreInAcrossLoopDSE = 32;
+
+static cl::opt<unsigned> AcrossLoopStoreThreshold(
+    "dse-across-loop-store-threshold", cl::init(MaxStoreInAcrossLoopDSE),
+    cl::Hidden,
+    cl::desc("The maximum number of stores across loops to optimize"));
 
 static cl::opt<bool>
 EnablePartialOverwriteTracking("enable-dse-partial-overwrite-tracking",
@@ -727,6 +786,32 @@ bool canSkipDef(MemoryDef *D, bool DefVisibleToCaller) {
   return false;
 }
 
+// It represents a range in memory that MemoryDef overwrites completely
+// without gaps. If there are supposed to be at least one gap within a range
+// then do not create an instance of this type
+// TODO: We need offset for base pointer too
+struct ContinuousMemoryRange {
+  const SCEV *Start;
+  const SCEV *Length;
+
+  ContinuousMemoryRange(const SCEV *Start, const SCEV *Length)
+      : Start(Start), Length(Length) {}
+
+  static ContinuousMemoryRange createEmpty() {
+    return ContinuousMemoryRange(nullptr, nullptr);
+  }
+
+  bool isEmpty() { return Start == nullptr || Length == nullptr; }
+
+  bool operator==(const ContinuousMemoryRange &Other) const {
+    return Start == Other.Start && Length == Other.Length;
+  }
+
+  bool operator!=(const ContinuousMemoryRange &Other) const {
+    return !(*this == Other);
+  }
+};
+
 struct DSEState {
   Function &F;
   AliasAnalysis &AA;
@@ -740,17 +825,18 @@ struct DSEState {
   ///    information for a deleted value cannot be accessed by a re-used new
   ///    value pointer.
   BatchAAResults BatchAA;
-
   MemorySSA &MSSA;
   DominatorTree &DT;
   PostDominatorTree &PDT;
   const TargetLibraryInfo &TLI;
   const DataLayout &DL;
   const LoopInfo &LI;
-
+  ScalarEvolution *SE;
   // Whether the function contains any irreducible control flow, useful for
   // being accurately able to detect loops.
   bool ContainsIrreducibleLoops;
+
+  bool ControlFlowChanged;
 
   // All MemoryDefs that potentially could kill other MemDefs.
   SmallVector<MemoryDef *, 64> MemDefs;
@@ -767,6 +853,26 @@ struct DSEState {
   // accesses are executed before another access.
   DenseMap<BasicBlock *, unsigned> PostOrderNumbers;
 
+  // This map may contain loop-variant store which fits the following
+  // requirements
+  // - It is not volatile or atomic
+  // - It may not throw
+  // - Store size == stride
+  // - Store type is integer or floating scalar
+  // - It must always execute
+  // And their loop must match the following requirements
+  // - Its backedge taken count is computable
+  // - It has simplify rotated form
+  // - Induction variable starts from zero
+  // - There is no throwing instruction
+  DenseMap<Instruction *, ContinuousMemoryRange> MemRanges;
+
+  // A set for stores that are not guaranteed to execute
+  // TODO: Do we need to save stores which are guaranteed to execute or not?
+  // Which is more likely to happen?
+  SmallPtrSet<Instruction *, MaxStoreInAcrossLoopDSE>
+      StoresNotGuaranteedToExecute;
+
   /// Keep track of instructions (partly) overlapping with killing MemoryDefs per
   /// basic block.
   MapVector<BasicBlock *, InstOverlapIntervalsTy> IOLs;
@@ -779,11 +885,57 @@ struct DSEState {
   DSEState(const DSEState &) = delete;
   DSEState &operator=(const DSEState &) = delete;
 
+  void prepareStateForAcrossLoopOptimization() {
+    MemDefs.clear();
+    ICFLoopSafetyInfo SafetyInfo;
+    for (auto *L : LI) {
+      if (!canAddMoreStoresFromLoop()) {
+        break;
+      }
+      ++LoopCount;
+
+      // TODO: There is a potential enhancement to handle stores in nested
+      // loops, but skip it for now. Do we even need this?
+      if (!L->isInnermost() || !L->isOutermost()) {
+        continue;
+      }
+
+      // We can easily find loops with a large number of basic blocks so
+      // limit it to some extent
+      if (L->getNumBlocks() > BasicBlocksInOneLoopThreshold) {
+        ++TooManyBlocksInLoop;
+        continue;
+      }
+      // If one block in loop then it is easy to handle, but otherwise check
+      // if loop has some canonical form
+      if (L->getNumBlocks() != 1) {
+        if (!L->isRotatedForm() && L->getNumBlocks() != 1) {
+          ++NotRotatedFormLoop;
+          continue;
+        }
+
+        if (!L->isLoopSimplifyForm()) {
+          ++NotSimplifyFormLoop;
+          continue;
+        }
+      }
+
+      SafetyInfo.computeLoopSafetyInfo(L);
+      if (SafetyInfo.anyBlockMayThrow()) {
+        ++MayThrowInLoop;
+        continue;
+      }
+
+      prepareLoopVariantStoresWithRanges(L, SafetyInfo);
+    }
+    CollectedStoreCount += MemDefs.size();
+  }
+
   DSEState(Function &F, AliasAnalysis &AA, MemorySSA &MSSA, DominatorTree &DT,
-           PostDominatorTree &PDT, const TargetLibraryInfo &TLI,
-           const LoopInfo &LI)
+           PostDominatorTree &PDT, ScalarEvolution *SE,
+           const TargetLibraryInfo &TLI, const LoopInfo &LI)
       : F(F), AA(AA), EI(DT, LI), BatchAA(AA, &EI), MSSA(MSSA), DT(DT),
-        PDT(PDT), TLI(TLI), DL(F.getParent()->getDataLayout()), LI(LI) {
+        PDT(PDT), TLI(TLI), DL(F.getParent()->getDataLayout()), LI(LI), SE(SE) {
     // Collect blocks with throwing instructions not modeled in MemorySSA and
     // alloc-like objects.
     unsigned PO = 0;
@@ -793,11 +945,11 @@ struct DSEState {
         MemoryAccess *MA = MSSA.getMemoryAccess(&I);
         if (I.mayThrow() && !MA)
           ThrowingBlocks.insert(I.getParent());
-
         auto *MD = dyn_cast_or_null<MemoryDef>(MA);
         if (MD && MemDefs.size() < MemorySSADefsPerBlockLimit &&
-            (getLocForWrite(&I) || isMemTerminatorInst(&I)))
+            (getLocForWrite(&I) || isMemTerminatorInst(&I))) {
           MemDefs.push_back(MD);
+        }
       }
     }
 
@@ -815,6 +967,145 @@ struct DSEState {
     });
   }
 
+  bool canAddMoreStoresFromLoop() {
+    return MemDefs.size() <= AcrossLoopStoreThreshold;
+  }
+
+  void prepareLoopVariantStoresWithRanges(Loop *L,
+                                          ICFLoopSafetyInfo &SafetyInfo) {
+    for (auto *BB : L->getBlocks()) {
+      if (!canAddMoreStoresFromLoop()) {
+        break;
+      }
+
+      for (auto &I : *BB) {
+        if (!canAddMoreStoresFromLoop()) {
+          break;
+        }
+
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (!SafetyInfo.isGuaranteedToExecute(I, &DT, L)) {
+            StoresNotGuaranteedToExecute.insert(&I);
+          }
+
+          // TODO: If store is volatile, it can overwrite another non-volatile
+          // store We shouldn't skip it here, but probably just not to remove
+          // volatile stores
+          if (I.isVolatile() || I.isAtomic()) {
+            ++VolatileOrAtomicInLoop;
+            continue;
+          }
+
+          auto Range = computeMemoryRange(L, S);
+          if (!Range.isEmpty()) {
+            auto *MD = cast<MemoryDef>(MSSA.getMemoryAccess(S));
+            MemDefs.push_back(MD);
+            addMemRange(S, Range);
+            ++ComputedStoreMemRanges;
+            continue;
+          }
+          ++FailedToComputeRangeForStore;
+        }
+      }
+    }
+  }
+
+  void addMemRange(Instruction *I, ContinuousMemoryRange &Range) {
+    if (Range.isEmpty())
+      return;
+    MemRanges.insert({I, Range});
+  }
+
+  // This computes a continuous range that memory intrinsic fills
+  //
+  // If it cannot compute a range, it will return an empty range
+  ContinuousMemoryRange computeMemoryRange(const AnyMemIntrinsic *MemIntr) {
+    const auto *Length = SE->getSCEV(MemIntr->getLength());
+    if (isa<SCEVCouldNotCompute>(Length))
+      return ContinuousMemoryRange::createEmpty();
+    auto *Start = SE->getSCEV(MemIntr->getDest());
+    return ContinuousMemoryRange(Start, Length);
+  }
+
+  // This computes a continuous range to which a store within a loop write
+  // It works only with loops where there is a canonical induction variable
+  //
+  // If it cannot compute a range, it will return an empty range
+  ContinuousMemoryRange computeMemoryRange(Loop *L, StoreInst *Store) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(Store->getPointerOperand());
+    if (!GEP)
+      return ContinuousMemoryRange::createEmpty();
+
+    // This method implies that GEP and store are from the same loop and as a
+    // result GEP depends on induction variable of the loop. It is possible that
+    // GEP can be from another loop and we still compute memory range for it,
+    // but we should skip it because the resulting range can be wrong
+    if (!L->contains(GEP))
+      return ContinuousMemoryRange::createEmpty();
+
+    auto *Type = Store->getValueOperand()->getType();
+    if (!Type->isFloatingPointTy() && !Type->isIntegerTy())
+      return ContinuousMemoryRange::createEmpty();
+
+    auto *StoreRec = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(GEP));
+    if (!StoreRec)
+      return ContinuousMemoryRange::createEmpty();
+
+    if (!StoreRec->isAffine())
+      return ContinuousMemoryRange::createEmpty();
+
+    auto *BTC = SE->getBackedgeTakenCount(L);
+    if (isa<SCEVCouldNotCompute>(BTC))
+      return ContinuousMemoryRange::createEmpty();
+
+    const auto *Start = StoreRec->getOperand(0);
+    if (isa<SCEVCouldNotCompute>(Start))
+      return ContinuousMemoryRange::createEmpty();
+
+    auto *Count = SE->getAddExpr(BTC, SE->getOne(BTC->getType()));
+    auto SizeInBytes =
+        Store->getValueOperand()->getType()->getScalarSizeInBits() / 8;
+    auto *StoreSize = SE->getConstant(Count->getType(), SizeInBytes);
+
+    auto *Step = StoreRec->getOperand(1);
+    if (Step != StoreSize)
+      return ContinuousMemoryRange::createEmpty();
+
+    const auto *Length = SE->getMulExpr(Count, StoreSize);
+    if (isa<SCEVCouldNotCompute>(Length))
+      return ContinuousMemoryRange::createEmpty();
+    return ContinuousMemoryRange(Start, Length);
+  }
+
+  bool isOptimizableAcrossLoops(const Instruction *KillingI,
+                                const Instruction *DeadI) {
+    if (!EnableOptimizationAcrossLoops)
+      return false;
+
+    // None of these instructions is a store in a loop, so skip it.
+    // Alias Analysis can handle two memory intrinsics.
+    if (isa<AnyMemIntrinsic>(DeadI) && isa<AnyMemIntrinsic>(KillingI))
+      return false;
+
+    // Killing store must always execute. Otherwise, it needs additional
+    // analysis to prove that KillingI overwrites DeadI, see below for (...)
+    //  if (x)
+    //    arr[i] = C1 <-- Is arr filled by C2 later or not?
+    // ...
+    // for (...)
+    //  if (y)
+    //    arr[i] = C2
+    //
+    // TODO: What if x == y as in the example above? We should probably rely on
+    // loop unswitch and other similar optimizations to remove if-statement that
+    // allow DSE to optimize it
+    if (isa<StoreInst>(KillingI) &&
+        StoresNotGuaranteedToExecute.contains(KillingI))
+      return false;
+
+    return true;
+  }
+
   /// Return 'OW_Complete' if a store to the 'KillingLoc' location (by \p
   /// KillingI instruction) completely overwrites a store to the 'DeadLoc'
   /// location (by \p DeadI instruction).
@@ -828,6 +1119,10 @@ struct DSEState {
                               const MemoryLocation &KillingLoc,
                               const MemoryLocation &DeadLoc,
                               int64_t &KillingOff, int64_t &DeadOff) {
+    if (isOptimizableAcrossLoops(KillingI, DeadI))
+      if (isLoopVariantStoreOverwrite(KillingI, DeadI))
+        return OW_Complete;
+
     // AliasAnalysis does not always account for loops. Limit overwrite checks
     // to dependencies for which we can guarantee they are independent of any
     // loops they are in.
@@ -1180,6 +1475,7 @@ struct DSEState {
     if (!ContainsIrreducibleLoops && CurrentLI &&
         CurrentLI == LI.getLoopFor(KillingDef->getParent()))
       return true;
+
     // Otherwise check the memory location is invariant to any loops.
     return isGuaranteedLoopInvariant(CurrentLoc.Ptr);
   }
@@ -1316,10 +1612,13 @@ struct DSEState {
       // candidates for which we can guarantee they always store to the same
       // memory location and not located in different loops.
       if (!isGuaranteedLoopIndependent(CurrentI, KillingI, *CurrentLoc)) {
-        LLVM_DEBUG(dbgs() << "  ... not guaranteed loop independent\n");
-        WalkerStepLimit -= 1;
-        CanOptimize = false;
-        continue;
+
+        if (!EnableOptimizationAcrossLoops || MemRanges.empty()) {
+          LLVM_DEBUG(dbgs() << "  ... not guaranteed loop independent\n");
+          WalkerStepLimit -= 1;
+          CanOptimize = false;
+          continue;
+        }
       }
 
       if (IsMemTerm) {
@@ -1452,12 +1751,15 @@ struct DSEState {
       }
 
       // If this worklist walks back to the original memory access (and the
-      // pointer is not guarenteed loop invariant) then we cannot assume that a
-      // store kills itself.
+      // pointer is not guarenteed loop invariant) then we cannot assume that
+      // a store kills itself.
       if (MaybeDeadAccess == UseAccess &&
           !isGuaranteedLoopInvariant(MaybeDeadLoc.Ptr)) {
-        LLVM_DEBUG(dbgs() << "    ... found not loop invariant self access\n");
-        return None;
+        if (!EnableOptimizationAcrossLoops || !MemRanges.count(MaybeDeadI)) {
+          LLVM_DEBUG(dbgs()
+                     << "    ... found not loop invariant self access\n");
+          return None;
+        }
       }
       // Otherwise, for the KillingDef and MaybeDeadAccess we only have to check
       // if it reads the memory location.
@@ -1503,8 +1805,13 @@ struct DSEState {
     // MaybeDeadAccess to the exit.
     if (!isInvisibleToCallerAfterRet(KillingUndObj)) {
       SmallPtrSet<BasicBlock *, 16> KillingBlocks;
-      for (Instruction *KD : KillingDefs)
-        KillingBlocks.insert(KD->getParent());
+      for (Instruction *KD : KillingDefs) {
+        if (EnableOptimizationAcrossLoops) {
+          KillingBlocks.insert(tryToReplaceByGuard(KD, KD->getParent()));
+        } else {
+          KillingBlocks.insert(KD->getParent());
+        }
+      }
       assert(!KillingBlocks.empty() &&
              "Expected at least a single killing block");
 
@@ -1573,6 +1880,85 @@ struct DSEState {
     return {MaybeDeadAccess};
   }
 
+  /**
+   * This function does not do anything with loop-invariant instructions and
+   * simply returns their KillingBlock, otherwise it tries to return a guard
+   */
+  BasicBlock *tryToReplaceByGuard(Instruction *KillingI,
+                                  BasicBlock *KillingBlock) {
+    assert(KillingI->getParent() == KillingBlock &&
+           "Killing instruction must be inside KillingBlock");
+    if (!EnableOptimizationAcrossLoops)
+      return KillingBlock;
+
+    if (!MemRanges.count(KillingI))
+      return KillingBlock;
+
+    if (!isa<StoreInst>(KillingI))
+      return KillingBlock;
+
+    auto *L = LI.getLoopFor(KillingBlock);
+    assert(L && "Killing instruction must be inside a loop here");
+    assert((L->isLoopSimplifyForm() && L->isRotatedForm()) ||
+           L->getNumBlocks() == 1 &&
+               "Loop must be in simplify rotated form or consist of one block");
+    if (!L->isGuarded()) {
+      ++MissedGuard;
+      return KillingBlock;
+    }
+
+    auto *Br = L->getLoopGuardBranch();
+    assert(Br &&
+           "Loop is in simplify form, but it does not seem to have a guard");
+    if (auto *Guard = Br->getParent()) {
+      ++ReplacedGuard;
+      return Guard;
+    }
+    return KillingBlock;
+  }
+
+  bool isLoopVariantStoreOverwrite(const Instruction *KillingI,
+                                   const Instruction *DeadI) {
+    auto KillingRange = MemRanges.find(KillingI);
+    auto DeadRange = MemRanges.find(DeadI);
+
+    if (MemRanges.count(DeadI) && MemRanges.count(KillingI))
+      return DeadRange->second == KillingRange->second;
+
+    if (MemRanges.count(DeadI) && isa<AnyMemIntrinsic>(KillingI)) {
+      auto MemIntrRange = computeMemoryRange(cast<AnyMemIntrinsic>(KillingI));
+      if (!MemIntrRange.isEmpty())
+        ++ComputedMemIntrMemRanges;
+      return DeadRange->second == MemIntrRange;
+    } else if (MemRanges.count(KillingI) && isa<AnyMemIntrinsic>(DeadI)) {
+      auto MemIntrRange = computeMemoryRange(cast<AnyMemIntrinsic>(DeadI));
+      if (!MemIntrRange.isEmpty())
+        ++ComputedMemIntrMemRanges;
+      return KillingRange->second == MemIntrRange;
+    }
+
+    return false;
+  }
+
+  void countDeadStores(Instruction *Dead, Instruction *Killing) {
+#ifdef LLVM_ENABLE_STATS
+    if (AreStatisticsEnabled()) {
+      if (isa<StoreInst>(Dead)) {
+        if (MemRanges.count(Dead))
+          ++LoopVariantStoreRemoved;
+      }
+      if (MemRanges.count(Dead) && 
+          MemRanges.count(Killing) && 
+          isa<AnyMemIntrinsic>(Dead) && 
+          isa<StoreInst>(Killing)) {
+          ++RemovedMemIntrWithRange;
+      }
+    }
+#endif
+  }
+
+  // TODO: If this instruction is loop-variant store, then we don't remove
+  // loops that had nothing more than just deleted store
   // Delete dead memory defs
   void deleteDeadInstruction(Instruction *SI) {
     MemorySSAUpdater Updater(&MSSA);
@@ -1929,13 +2315,8 @@ struct DSEState {
   }
 };
 
-static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
-                                DominatorTree &DT, PostDominatorTree &PDT,
-                                const TargetLibraryInfo &TLI,
-                                const LoopInfo &LI) {
+static bool runDSEOptimizationLoop(DSEState &State) {
   bool MadeChange = false;
-
-  DSEState State(F, AA, MSSA, DT, PDT, TLI, LI);
   // For each store:
   for (unsigned I = 0; I < State.MemDefs.size(); I++) {
     MemoryDef *KillingDef = State.MemDefs[I];
@@ -2020,6 +2401,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
           continue;
         LLVM_DEBUG(dbgs() << "DSE: Remove Dead Store:\n  DEAD: " << *DeadI
                           << "\n  KILLER: " << *KillingI << '\n');
+        State.countDeadStores(DeadI, KillingI);
         State.deleteDeadInstruction(DeadI);
         ++NumFastStores;
         MadeChange = true;
@@ -2044,10 +2426,10 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
           // We are re-using tryToMergePartialOverlappingStores, which requires
           // DeadSI to dominate DeadSI.
           // TODO: implement tryToMergeParialOverlappingStores using MemorySSA.
-          if (DeadSI && KillingSI && DT.dominates(DeadSI, KillingSI)) {
+          if (DeadSI && KillingSI && State.DT.dominates(DeadSI, KillingSI)) {
             if (Constant *Merged = tryToMergePartialOverlappingStores(
                     KillingSI, DeadSI, KillingOffset, DeadOffset, State.DL,
-                    State.BatchAA, &DT)) {
+                    State.BatchAA, &State.DT)) {
 
               // Update stored value of earlier store to merged constant.
               DeadSI->setOperand(0, Merged);
@@ -2055,6 +2437,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
               MadeChange = true;
 
               Shortend = true;
+              State.countDeadStores(DeadI, KillingI);
               // Remove killing store and remove any outstanding overlap
               // intervals for the updated store.
               State.deleteDeadInstruction(KillingSI);
@@ -2069,6 +2452,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
         if (OR == OW_Complete) {
           LLVM_DEBUG(dbgs() << "DSE: Remove Dead Store:\n  DEAD: " << *DeadI
                             << "\n  KILLER: " << *KillingI << '\n');
+          State.countDeadStores(DeadI, KillingI);
           State.deleteDeadInstruction(DeadI);
           ++NumFastStores;
           MadeChange = true;
@@ -2095,6 +2479,61 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
       continue;
     }
   }
+  return MadeChange;
+}
+
+static bool runAcrossLoopDSE(DSEState &State) {
+  if (!EnableOptimizationAcrossLoops) {
+    return false;
+  }
+  // Run across loop optimization at the end because it will preserve some time
+  // on things like calculating SCEVs because there are loops like for (...)
+  //    P[i] = 1;
+  //    ...
+  //    P[i] = 3;
+  // Both stores are at the same loop level and DSE can remove them
+  // As both stores can be candidates for removal in across loop optimization
+  // we will remove all store we can first and later try to optimize survived
+  // ones So this one below will be transformed for (...)
+  //    P[i] = 1;
+  //    ...
+  //    P[i] = 3;
+  // -->
+  // for (...)
+  //    ...
+  //    P[i] = 3;
+  // And P[i] = 3 will be removed in across loop optimization by some other
+  // store in other loop Plus, P[i] = 3 would be checked first and won't be
+  // considered as dead store killed by another loop's store see the examle
+  // below
+  // loop:
+  // ; 10 = MemoryPhi({preheader1,liveOnEntry},{loop,2})
+  // %loop.iv = phi i64 [ 0, %preheader1 ], [ %loop.iv, %loop ]
+  // %loop.idx = getelementptr inbounds i32, ptr %ptr, i64 %loop.iv
+  // ; 1 = MemoryDef(10)
+  // store i32 2, ptr %loop.1.idx, align 4
+  // ; 2 = MemoryDef(1)
+  // store i32 2, ptr %loop.1.idx, align 4
+  // %loop.iv.1 = add nuw nsw i64 %loop.iv, 1
+  // %loop.cond = icmp eq i64 %loop.iv.1, %n.zext1
+  // br i1 %loop.cond, label %loop.exit, label %
+  // 2 = MemoryDef(1) is read by MemoryPhi and this Phi used by preceding store
+  // So it is better to try to kill 1 by 2
+
+  State.prepareStateForAcrossLoopOptimization();
+  return runDSEOptimizationLoop(State);
+}
+
+static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
+                                DominatorTree &DT, PostDominatorTree &PDT,
+                                ScalarEvolution *SE,
+                                const TargetLibraryInfo &TLI,
+                                const LoopInfo &LI) {
+
+  DSEState State(F, AA, MSSA, DT, PDT, SE, TLI, LI);
+  bool MadeChange = false;
+
+  MadeChange |= runDSEOptimizationLoop(State);
 
   if (EnablePartialOverwriteTracking)
     for (auto &KV : State.IOLs)
@@ -2102,6 +2541,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
 
   MadeChange |= State.eliminateRedundantStoresOfExistingValues();
   MadeChange |= State.eliminateDeadWritesAtEndOfFunction();
+  MadeChange |= runAcrossLoopDSE(State);
   return MadeChange;
 }
 } // end anonymous namespace
@@ -2116,8 +2556,11 @@ PreservedAnalyses DSEPass::run(Function &F, FunctionAnalysisManager &AM) {
   MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
   PostDominatorTree &PDT = AM.getResult<PostDominatorTreeAnalysis>(F);
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
-
-  bool Changed = eliminateDeadStores(F, AA, MSSA, DT, PDT, TLI, LI);
+  ScalarEvolution *SE = nullptr;
+  if (EnableOptimizationAcrossLoops) {
+    SE = &AM.getResult<ScalarEvolutionAnalysis>(F);
+  }
+  bool Changed = eliminateDeadStores(F, AA, MSSA, DT, PDT, SE, TLI, LI);
 
 #ifdef LLVM_ENABLE_STATS
   if (AreStatisticsEnabled())
@@ -2125,10 +2568,13 @@ PreservedAnalyses DSEPass::run(Function &F, FunctionAnalysisManager &AM) {
       NumRemainingStores += isa<StoreInst>(&I);
 #endif
 
-  if (!Changed)
+  if (!Changed) {
     return PreservedAnalyses::all();
-
+  }
   PreservedAnalyses PA;
+  if (EnableOptimizationAcrossLoops) {
+    PA.preserve<ScalarEvolutionAnalysis>();
+  }
   PA.preserveSet<CFGAnalyses>();
   PA.preserve<MemorySSAAnalysis>();
   PA.preserve<LoopAnalysis>();
@@ -2158,8 +2604,11 @@ public:
     PostDominatorTree &PDT =
         getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
     LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-
-    bool Changed = eliminateDeadStores(F, AA, MSSA, DT, PDT, TLI, LI);
+    ScalarEvolution *SE = nullptr;
+    if (EnableOptimizationAcrossLoops) {
+      SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    }
+    bool Changed = eliminateDeadStores(F, AA, MSSA, DT, PDT, SE, TLI, LI);
 
 #ifdef LLVM_ENABLE_STATS
     if (AreStatisticsEnabled())
@@ -2172,6 +2621,10 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
+    if (EnableOptimizationAcrossLoops) {
+      AU.addRequired<ScalarEvolutionWrapperPass>();
+      AU.addPreserved<ScalarEvolutionWrapperPass>();
+    }
     AU.addRequired<AAResultsWrapperPass>();
     AU.addRequired<TargetLibraryInfoWrapperPass>();
     AU.addPreserved<GlobalsAAWrapperPass>();
@@ -2185,7 +2638,6 @@ public:
     AU.addPreserved<LoopInfoWrapperPass>();
   }
 };
-
 } // end anonymous namespace
 
 char DSELegacyPass::ID = 0;
@@ -2200,6 +2652,7 @@ INITIALIZE_PASS_DEPENDENCY(MemorySSAWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MemoryDependenceWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_END(DSELegacyPass, "dse", "Dead Store Elimination", false,
                     false)
 
